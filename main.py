@@ -1,18 +1,90 @@
-from typing import Literal, Optional, Dict
-from datetime import datetime
+from typing import Literal, Optional, Dict, Union
+from datetime import datetime, date
 import http.client
 import json
 import os
 from dotenv import load_dotenv
 from urllib.parse import urlencode
 import argparse
+import readchar
+import sys
 
-def get_exchange_rate(date: str, direction: Literal["to_btc", "from_btc"], currency: str, verbose: bool = False) -> Optional[Dict[str, float]]:
+def get_input(prompt: str, validator=None, allowed_chars: str = None) -> str:
     """
-    Fetches historical exchange rates between BTC and specified fiat currency using CurrencyFreaks API.
+    Get user input with backspace support and optional validation.
     
     Args:
-        date: Date in YYYY-MM-DD format
+        prompt: Input prompt to display
+        validator: Optional function to validate input
+        allowed_chars: Optional string of allowed characters
+        
+    Returns:
+        Validated user input
+    """
+    print(prompt, end='', flush=True)
+    buffer = []
+    
+    while True:
+        char = readchar.readchar()
+        
+        # Handle Enter key
+        if char in ['\r', '\n']:
+            if not buffer:
+                continue
+            result = ''.join(buffer)
+            if validator and not validator(result):
+                print("\nInvalid input. Please try again.")
+                buffer = []
+                print(f"\n{prompt}", end='', flush=True)
+                continue
+            print()  # New line after input
+            return result
+            
+        # Handle backspace
+        if char == '\x7f':  # Backspace character
+            if buffer:
+                buffer.pop()
+                sys.stdout.write('\b \b')  # Erase character
+                sys.stdout.flush()
+            continue
+            
+        # Handle regular characters
+        if allowed_chars and char not in allowed_chars:
+            continue
+            
+        if char.isprintable():
+            buffer.append(char)
+            sys.stdout.write(char)
+            sys.stdout.flush()
+
+def validate_date(date_str: str) -> bool:
+    """Validate date string format and range."""
+    try:
+        input_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        earliest_date = datetime.strptime("2013-01-07", "%Y-%m-%d").date()  # BTC availability date
+        return earliest_date <= input_date <= date.today()
+    except ValueError:
+        return False
+
+def validate_direction(direction: str) -> bool:
+    """Validate conversion direction."""
+    return direction.lower() in ['to', 'from']
+
+def validate_amount(amount: str) -> bool:
+    """Validate numeric amount."""
+    try:
+        float(amount)
+        return True
+    except ValueError:
+        return False
+
+def get_exchange_rate(date_str: Optional[str], direction: Literal["to_btc", "from_btc"], 
+                     currency: str, verbose: bool = False) -> Optional[Dict[str, float]]:
+    """
+    Fetches exchange rates between BTC and specified fiat currency.
+    
+    Args:
+        date_str: Optional date in YYYY-MM-DD format (None for current rates)
         direction: Conversion direction - either "to_btc" or "from_btc"
         currency: Fiat currency code (e.g. USD, EUR)
         verbose: Whether to print detailed API response info
@@ -27,21 +99,20 @@ def get_exchange_rate(date: str, direction: Literal["to_btc", "from_btc"], curre
         print("Error: API key not found in .env file")
         return None
 
-    try:
-        datetime.strptime(date, "%Y-%m-%d")
-    except ValueError:
-        raise ValueError("Invalid date format. Please use YYYY-MM-DD")
-
     conn = http.client.HTTPSConnection("api.currencyfreaks.com")
     
     params = {
-        "date": date,
         "base": "USD",
         "symbols": f"{currency},BTC",
         "apikey": api_key
     }
-    
-    endpoint = f"/v2.0/rates/historical?{urlencode(params)}"
+
+    # Choose endpoint based on whether we want historical or current rates
+    if date_str:
+        params["date"] = date_str
+        endpoint = f"/v2.0/rates/historical?{urlencode(params)}"
+    else:
+        endpoint = f"/v2.0/rates/latest?{urlencode(params)}"
     
     try:
         conn.request("GET", endpoint)
@@ -85,7 +156,8 @@ def get_exchange_rate(date: str, direction: Literal["to_btc", "from_btc"], curre
         return {
             "rate": conversion_rate,
             "btc_price": btc_rate,
-            "currency_rate": currency_rate
+            "currency_rate": currency_rate,
+            "date": data.get("date", "current")
         }
             
     except Exception as e:
@@ -95,27 +167,10 @@ def get_exchange_rate(date: str, direction: Literal["to_btc", "from_btc"], curre
         conn.close()
 
 def format_number(value: float) -> str:
-    """
-    Format a float number with custom grouping:
-    Before decimal: groups of three digits
-    After decimal: first two digits together, then groups of three
-    
-    Examples:
-        123456.78901230 -> "123 456.78 901 230"
-
-    Args:
-        value: Float number to format
-    
-    Returns:
-        Formatted string with specified spacing
-    """
-    # Convert to string with 8 decimal places
+    """Format number with custom grouping."""
     str_value = f"{value:.8f}"
-    
-    # Split into integer and decimal parts
     int_part, dec_part = str_value.split('.')
     
-    # Group integer part by 3 from right to left
     int_groups = []
     for i in range(len(int_part)-3, -3, -3):
         if i < 0:
@@ -124,56 +179,66 @@ def format_number(value: float) -> str:
             int_groups.insert(0, int_part[i:i+3])
     grouped_int = ' '.join(filter(None, int_groups))
     
-    # Handle decimal part: first 2 digits, then groups of 3
     first_dec = dec_part[:2]
     remaining_dec = dec_part[2:]
     
-    # Group remaining decimal part by 3
     dec_groups = []
     for i in range(0, len(remaining_dec), 3):
         dec_groups.append(remaining_dec[i:i+3])
     
-    # Combine decimal groups
     grouped_dec = f"{first_dec} {' '.join(dec_groups)}" if dec_groups else first_dec
     
     return f"{grouped_int}.{grouped_dec}"
-
 def main() -> None:
-    """
-    CLI interface for getting cryptocurrency exchange rates.
-    """
-    parser = argparse.ArgumentParser(description="Get historical cryptocurrency exchange rates")
+    """CLI interface for getting cryptocurrency exchange rates."""
+    parser = argparse.ArgumentParser(description="Get historical and current cryptocurrency exchange rates")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show detailed API response")
     args = parser.parse_args()
 
-    date = input("Enter date (YYYY-MM-DD): ")
-    direction = input("Convert to BTC or from BTC? (to/from): ")
-    currency = input("Enter currency (USD/EUR/other): ").upper()
+    # Get conversion type (historical or current)
+    rate_type = get_input("Get [h]istorical or [c]urrent rate? (h/c): ", 
+                         lambda x: x.lower() in ['h', 'c'],
+                         allowed_chars='hcHC').lower()
+
+    # Get date for historical rates
+    date_str = None
+    if rate_type == 'h':
+        date_str = get_input("Enter date (YYYY-MM-DD): ", validate_date)
+
+    # Get other inputs with validation
+    direction = get_input("Convert to BTC or from BTC? (to/from): ", validate_direction)
+    currency = get_input("Enter currency (e.g., USD/EUR): ", lambda x: len(x) == 3).upper()
+    amount = get_input(f"Enter amount to convert: ", validate_amount)
     
     try:
-        amount = float(input(f"Enter amount to convert: "))
+        amount = float(amount)
     except ValueError:
         print("Invalid amount. Please enter a number.")
         return
     
     direction_map = {"to": "to_btc", "from": "from_btc"}
     
-    if direction.lower() not in direction_map:
-        print("Invalid direction. Please enter 'to' or 'from'")
-        return
-        
-    result = get_exchange_rate(date, direction_map[direction.lower()], currency, args.verbose)
+    # Get current rate first if we're doing historical
+    current_rate = None
+    if rate_type == 'h':
+        current_rate = get_exchange_rate(None, direction_map[direction.lower()], currency, args.verbose)
+    
+    # Get requested rate (historical or current)
+    result = get_exchange_rate(date_str, direction_map[direction.lower()], currency, args.verbose)
     
     if result:
         rate = result["rate"]
         if direction.lower() == "to":
-            converted = amount * rate
-            converted = format_number(converted)
-            print(f"{amount} {currency} = {converted} BTC")
+            converted_value = amount * rate  # Store raw value
+            converted_str = format_number(converted_value)  # Formatted string for display
+            print(f"\n{amount} {currency} = {converted_str} BTC")
+            print(f"Rate used: 1 BTC = {1/result['btc_price']:,.2f} USD (from {result['date']})")
         else:
-            converted = amount * rate
-            amount = format_number(amount)
-            print(f"{amount} BTC = {converted:.2f} {currency}")
+            converted_value = amount * rate  # Store raw value
+            amount_str = format_number(amount)
+            print(f"\n{amount_str} BTC = {converted_value:,.2f} {currency}")
+            print(f"Rate used: 1 BTC = {1/result['btc_price']:,.2f} USD (from {result['date']})")
+        
 
 if __name__ == "__main__":
     main()
